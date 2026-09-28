@@ -4,7 +4,7 @@
 
 from functools import lru_cache
 
-from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
+from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
@@ -85,6 +85,8 @@ PRIORITY_ENTITY_TYPES = {
     "CREDIT_CARD",
     "BANK_ACCOUNT",
     "PASSPORT",
+    "FURIGANA",
+    "ORGANIZATION",
 }
 
 
@@ -138,16 +140,18 @@ def analyze_text(text: str, entities: list, score_threshold: float = None):
     )
 
 
-def mask_text(text: str, entities: list = None, style: str = "tag", score_threshold: float = None):
-    """テキストをマスキングし、(マスキング後テキスト, 検出結果一覧) を返す。"""
+def analyze_resolved(text: str, entities: list = None, score_threshold: float = None):
+    """重複解決済みの検出結果一覧を返す。ファイル処理側でも共通利用する。"""
     if not entities:
         entities = config.ALL_ENTITY_CODES
 
     if not text:
-        return "", []
+        return []
 
-    results = _resolve_overlaps(analyze_text(text, entities, score_threshold))
+    return _resolve_overlaps(analyze_text(text, entities, score_threshold))
 
+
+def _anonymize(text: str, results: list, style: str, entities: list) -> tuple:
     anonymizer = get_anonymizer()
     operators = _build_operators(style, entities)
     anonymized = anonymizer.anonymize(text=text, analyzer_results=results, operators=operators)
@@ -165,3 +169,69 @@ def mask_text(text: str, entities: list = None, style: str = "tag", score_thresh
     ]
 
     return anonymized.text, detections
+
+
+def mask_text(
+    text: str,
+    entities: list = None,
+    style: str = "tag",
+    score_threshold: float = None,
+    confirmed: set = None,
+):
+    """テキストをマスキングし、(マスキング後テキスト, 検出結果一覧) を返す。
+
+    confirmed を指定した場合、検出結果のうち (entity_type, 一致したテキスト) が
+    confirmed に含まれるものだけをマスキング対象とする(候補確認フロー用)。
+    None の場合は従来通り、検出結果を全てマスキングする。
+    """
+    if not entities:
+        entities = config.ALL_ENTITY_CODES
+
+    if not text:
+        return "", []
+
+    results = analyze_resolved(text, entities, score_threshold)
+    if confirmed is not None:
+        results = [
+            r for r in results if (r.entity_type, text[r.start : r.end].strip()) in confirmed
+        ]
+    return _anonymize(text, results, style, entities)
+
+
+def mask_resolved(
+    text: str,
+    results: list,
+    style: str,
+    entities: list = None,
+    confirmed: set = None,
+):
+    """呼び出し側で既に解決済みの検出結果一覧を使ってテキストをマスキングする。
+
+    file_processing.py 側でラベル直後の値の強制検出(_label_forced_results)を
+    NER結果とマージした上でマスキングしたい場合など、analyze_resolved() を
+    自前で呼ばずに結果一覧を直接渡したいケースに使う。
+    """
+    if not entities:
+        entities = config.ALL_ENTITY_CODES
+    if not text:
+        return "", []
+
+    if confirmed is not None:
+        results = [
+            r for r in results if (r.entity_type, text[r.start : r.end].strip()) in confirmed
+        ]
+    return _anonymize(text, results, style, entities)
+
+
+def mask_full_value(text: str, entity_type: str, style: str = "tag"):
+    """セル・フィールドの値全体を、指定したエンティティ種別として一括マスキングする。
+
+    表形式データ(CSV/Excel/JSON)で列名(例: 氏名・住所)からPIIの種別が
+    分かっている場合に使う。単語単体のセル値はspaCyのNERでは文脈不足のため
+    検出漏れしやすく、列名ベースで確実にマスキングするための経路。
+    """
+    if not text:
+        return text, []
+
+    result = RecognizerResult(entity_type=entity_type, start=0, end=len(text), score=1.0)
+    return _anonymize(text, [result], style, [entity_type])

@@ -1,0 +1,59 @@
+# 【重要】このファイルのHTTP-01検証は、実機確認の結果IDCFクラウドの
+# idcf-ilb IngressClassでは使えないことが判明している。cert-managerが
+# 検証用に生成する一時Ingress(ルート"/"パスを持たない)を、IDCF独自の
+# 管理Webhook(validate-idcf-ingress.idcfcloud.com)が拒否するため、
+# 証明書発行が常に失敗する(Challengeが`pending`のまま進まなくなる)。
+# このクラスタでは k8s/ingress.yaml の通り、既存証明書を
+# `kubectl create secret tls` で手動登録する方式を使っている
+# (詳細はk8s/OPERATIONS.mdの「TLS証明書(手動登録)の設定」参照)。
+#
+# 以下はDNS-01検証(DNSプロバイダのAPIでTXTレコードを操作する方式。
+# Ingressを使わないため上記の問題を回避できる)に対応したDNSプロバイダを
+# 使っている場合の参考用に残してある一般的な設定例(HTTP-01版)。
+# 実際に使う場合は、cert-managerのドキュメントを参照してsolversを
+# dns01に書き換えること
+# (この内容は一般的なcert-manager/Kubernetesの知識に基づく例であり、
+# IDCFクラウド側のドキュメントで動作確認はしていない)。
+#
+# 使い方:
+#   1. email を実際に通知を受け取れるアドレスに書き換える
+#   2. kubectl apply -f k8s/cluster-issuer.example.yaml
+#   3. k8s/ingress.yaml の cert-manager.io/cluster-issuer が
+#      このmetadata.nameと一致していることを確認
+#
+# 初回はLet's Encryptの本番発行(件数制限あり)に失敗しても気づきにくいため、
+# 先に下記のstaging版で疎通確認してから本番に切り替えることを推奨する。
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: your-email@example.com # 実際の連絡先メールアドレスに置き換える
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: idcf-ilb
+
+---
+# 動作確認用(先にこちらで試す場合)。本番用の証明書ではないため
+# ブラウザには警告が出るが、発行フロー自体が動くかを確認できる。
+# 使う場合は k8s/ingress.yaml の cert-manager.io/cluster-issuer を
+# letsencrypt-staging に変更する。
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: your-email@example.com # 実際の連絡先メールアドレスに置き換える
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: idcf-ilb

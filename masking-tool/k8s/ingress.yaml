@@ -1,0 +1,43 @@
+# IDCFクラウド コンテナには、nginx等の汎用Ingress Controllerではなく、
+# 独自のIngressClass(`idcf-ilb`、コントローラーは`idcfcloud.com/idcf-ingress`)
+# が用意されている(`kubectl get ingressclass` で実機確認済み)。これを
+# 指定するだけでILBとの連携が行われる(環境によって名前が異なる可能性が
+# あるため、必ず自分のクラスタで確認してから合わせること)。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: moya4
+  namespace: pii-masking-shield
+  annotations:
+    # cert-manager(Let's EncryptのHTTP-01検証)は使わない: cert-managerが
+    # 検証用に自動生成する一時Ingress(ルート"/"パスを持たない)を、IDCF独自の
+    # 管理Webhookが「defaultBackendまたは"/"パスのルールが必要」として
+    # 拒否することを実機で確認した。このクラスタではHTTP-01検証が構造的に
+    # 成立しないため、既存の証明書を`kubectl create secret tls`で手動登録し、
+    # tls.secretNameで参照する方式にしている(下記参照)。
+    #
+    # IDCFクラウドのIngressでTLSを使う場合、事前にコンソールで発行した
+    # SSLポリシーのIDをここに指定しないとLBの生成に失敗する
+    # (`generateLB failed: ... sslpolicy-id annotation is not found`)。
+    ilb.idcfcloud.com/sslpolicy-id: "8d74a56f-3248-43aa-b08b-ee4ad7ab5900"
+spec:
+  ingressClassName: idcf-ilb
+  tls:
+    - hosts:
+        - masking.pdpro.jp
+      secretName: moya4-tls
+  rules:
+    - host: masking.pdpro.jp
+      http:
+        paths:
+          - path: /
+            # IDCFクラウドの独自Ingress用アドミッションWebhook
+            # (validate-idcf-ingress.idcfcloud.com)は、pathTypeとして
+            # ImplementationSpecific以外(Prefix/Exact)を拒否することを
+            # 実機で確認した。標準的なPrefixではなくこちらを使う。
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: moya4
+                port:
+                  name: http
