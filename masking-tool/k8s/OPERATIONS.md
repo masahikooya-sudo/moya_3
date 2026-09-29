@@ -50,23 +50,35 @@ kubectl -n pii-masking-shield get pods
 kubectl -n pii-masking-shield logs -f deployment/moya4
 ```
 
-### ILB(Infinite LB)経由でのアクセス
+### ILB(Infinite LB)経由でのアクセス・TLS終端
 
 現在の既定構成(`k8s/service.yaml`、`type: LoadBalancer`)では、Ingressを
-使わず、申し込み済みのILBがこのServiceに直接割り当てられる。
+使わず、申し込み済みのILBがこのServiceに直接割り当てられる。**TLSは
+Kubernetes側(cert-manager/Secret)ではなく、ILB自体で終端する。**証明書は、
+IDCFクラウド コンソールで、`ilb.idcfcloud.com/sslpolicy-id` annotationが
+指すSSLポリシーに紐づけて登録する(証明書ファイルの準備・登録はクラスタ外、
+IDCFコンソール側の作業)。ILBがTLSを復号した後、Serviceへは平文HTTPで
+転送される。
+
+> **【未検証】** `ilb.idcfcloud.com/sslpolicy-id` annotationは、Ingress
+> リソースでは実機で動作を確認済みだが、`type: LoadBalancer` のServiceに
+> 対しても同様に機能するかは未確認。適用後、`describe`のEventsでLB生成に
+> 失敗していないか必ず確認すること。
 
 ```bash
+kubectl -n pii-masking-shield describe svc moya4
 kubectl -n pii-masking-shield get svc moya4
 # EXTERNAL-IP列にIPが表示される
 ```
 
 `EXTERNAL-IP`が表示されたら、DNS側で`masking.pdpro.jp`のAレコードをこのIPに
-向ける。設定後、社員は `http://masking.pdpro.jp:8000/` でアクセスできる。
+向ける。設定後、社員は `https://masking.pdpro.jp:8000/` でアクセスできる。
 
 `EXTERNAL-IP` が長時間 `<pending>` のままの場合は、IDCFクラウドのコンソールで
 ILBの申し込み状況(契約完了しているか)を確認する。
 
-DNS設定が済むまで先に動作だけ確認したい場合はポートフォワードを使う。
+DNS設定・証明書登録が済むまで先に動作だけ確認したい場合はポートフォワードを
+使う(この場合はTLS終端を経由しないため`http://localhost:8000`でアクセス)。
 
 ```bash
 kubectl -n pii-masking-shield port-forward svc/moya4 8000:8000
@@ -247,8 +259,8 @@ Namespace(`pii-masking-shield`)ごと削除され、`kubectl create secret` で
 | `ImagePullBackOff` | レジストリ認証Secット未設定・誤り、またはレジストリがHTTPS化されていない | `kubectl -n pii-masking-shield describe pod <pod名>` |
 | Podは`Running`だが`Ready`にならない | 起動直後でspaCyモデル読み込み中(`startupProbe`待ち、数十秒かかることがある) | `kubectl -n pii-masking-shield logs deployment/moya4` |
 | `svc/moya4`の`EXTERNAL-IP`が`<pending>`のまま | ILBの申し込み・契約が完了していない | `kubectl -n pii-masking-shield describe svc moya4` / IDCFコンソールでILBの状態を確認 |
-| `http://masking.pdpro.jp:8000/`にアクセスできない | DNSのAレコードが`svc/moya4`の`EXTERNAL-IP`を指していない、または反映待ち | `nslookup masking.pdpro.jp` / `kubectl -n pii-masking-shield get svc moya4` |
-| Googleログインでエラーになる | Google Cloud Consoleの承認済みリダイレクトURIと実際のURL(`http://masking.pdpro.jp:8000/auth/callback`)が不一致、またはGoogle側がHTTPのリダイレクトURIを拒否している | Google Cloud Consoleの認証情報画面を確認 |
+| `https://masking.pdpro.jp:8000/`にアクセスできない、または証明書エラー | DNSのAレコードが`svc/moya4`の`EXTERNAL-IP`を指していない/反映待ち、またはIDCFコンソール側でSSLポリシーに証明書が登録されていない | `nslookup masking.pdpro.jp` / `kubectl -n pii-masking-shield describe svc moya4` / IDCFコンソールでSSLポリシーの証明書設定を確認 |
+| Googleログインでエラーになる | Google Cloud Consoleの承認済みリダイレクトURIと実際のURL(`https://masking.pdpro.jp:8000/auth/callback`)が不一致 | Google Cloud Consoleの認証情報画面を確認 |
 | （Ingress+ドメイン+TLS方式に切り替えた場合）Ingress経由でアクセスできない | `ingressClassName` が実際のクラスタの名前と違う | `kubectl get ingressclass`(上記1章参照) |
 | （同上）HTTPSでアクセスできない・証明書エラー | `moya4-tls` Secretが未作成、または証明書ファイルが誤っている(このクラスタではcert-manager自動発行は使えない。上記「TLS証明書(手動登録)の設定」参照) | `kubectl -n pii-masking-shield get secret moya4-tls` |
 | （同上）Challengeが`pending`のまま・`admission webhook "validate-idcf-ingress.idcfcloud.com" denied ... defaultBackend or ... path or "/" is required` | cert-managerのHTTP-01検証用一時IngressがIDCFの管理Webhookに拒否されている(このクラスタでは構造的に非対応。手動証明書登録に切り替える) | `kubectl -n pii-masking-shield describe challenge <name>` |
