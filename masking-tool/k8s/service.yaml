@@ -1,13 +1,27 @@
+# ドメインは使うが、Ingress/TLSは使わず、IDCFクラウドのILB(Infinite LB)経由で
+# このアプリのServiceを直接HTTP公開する構成(社員は`http://masking.pdpro.jp:8000/`
+# でアクセスする想定。masking.pdpro.jpのDNS Aレコードを、下記で確認できる
+# ILBのIPに向ける必要がある)。
+#
+# annotationの `loadbalancer.idcfcloud.com/loadbalancer-class: "ilb"` により、
+# 申し込み済みのILBがこのServiceに割り当てられる。
+#
+# ドメイン+Ingress経由でのTLS終端(cert-manager等)を使いたい場合は、代わりに
+# `service-clusterip.example.yaml` をservice.yamlとして使い、
+# `kustomization.yaml` の `resources` に `ingress.yaml` を追加すること
+# (どちらもリポジトリ内に残してある)。
 apiVersion: v1
 kind: Service
 metadata:
   name: moya4
   namespace: pii-masking-shield
+  annotations:
+    loadbalancer.idcfcloud.com/loadbalancer-class: "ilb"
 spec:
   selector:
     app: moya4
   ports:
     - name: http
-      port: 80
+      port: 8000
       targetPort: http
-  type: ClusterIP
+  type: LoadBalancer

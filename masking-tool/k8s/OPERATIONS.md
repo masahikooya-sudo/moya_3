@@ -45,14 +45,41 @@ kubectl -n pii-masking-shield get pods
 kubectl -n pii-masking-shield logs -f deployment/moya4
 ```
 
-ドメイン・Ingressの設定が完了していれば `https://<ドメイン>/` でアクセスできる。
-未設定の段階で先に動作だけ確認したい場合はポートフォワードを使う。
-
 ```bash
-kubectl -n pii-masking-shield port-forward svc/moya4 8000:80
+kubectl -n pii-masking-shield get pods
+kubectl -n pii-masking-shield logs -f deployment/moya4
 ```
 
-### ILB(Infinite LB)との連携について
+### ILB(Infinite LB)経由でのアクセス
+
+現在の既定構成(`k8s/service.yaml`、`type: LoadBalancer`)では、Ingressを
+使わず、申し込み済みのILBがこのServiceに直接割り当てられる。
+
+```bash
+kubectl -n pii-masking-shield get svc moya4
+# EXTERNAL-IP列にIPが表示される
+```
+
+`EXTERNAL-IP`が表示されたら、DNS側で`masking.pdpro.jp`のAレコードをこのIPに
+向ける。設定後、社員は `http://masking.pdpro.jp:8000/` でアクセスできる。
+
+`EXTERNAL-IP` が長時間 `<pending>` のままの場合は、IDCFクラウドのコンソールで
+ILBの申し込み状況(契約完了しているか)を確認する。
+
+DNS設定が済むまで先に動作だけ確認したい場合はポートフォワードを使う。
+
+```bash
+kubectl -n pii-masking-shield port-forward svc/moya4 8000:8000
+```
+
+### 代替: ドメイン+Ingress+TLS終端を使う構成
+
+HTTPS化が必要になった場合は、以下の構成に切り替える。
+
+1. `k8s/service.yaml` を `k8s/service-clusterip.example.yaml` の内容で上書き
+2. `k8s/kustomization.yaml` の `resources` に `ingress.yaml` を追加
+3. `k8s/configmap.yaml` の `SESSION_HTTPS_ONLY` を `"true"` に変更
+   (HTTPSでの配信を前提にセッションCookieへ`Secure`属性を付与するため)
 
 IDCFクラウド コンテナには、nginx等の汎用Ingress Controllerではなく、
 **独自のIngressClass**が用意されている(確認環境では `idcf-ilb`、
@@ -64,14 +91,6 @@ kubectl get ingressclass
 
 表示された名前を、`k8s/ingress.yaml` の `ingressClassName` に設定する
 (既定では `idcf-ilb` にしてあるが、環境によって名前が異なる可能性がある)。
-この方式では、Ingress ControllerのServiceを探して手動でannotationを
-付与するといった作業は不要で、正しいIngressClassを指定するだけで
-ILBとの連携が行われる。
-
-Ingressを経由せず、このアプリのServiceに直接ILBを紐づけたい場合は
-`k8s/service-loadbalancer.example.yaml` を参照(ただしTLS終端が無いため、
-Googleログインに必要なHTTPS化は別途対応が必要になる。cert-managerによる
-TLS自動化を使いたい場合はIngress経由の方式を推奨する)。
 
 ### TLS証明書(手動登録)の設定
 
@@ -180,10 +199,10 @@ kubectl -n pii-masking-shield rollout restart deployment/moya4
 kubectl -n pii-masking-shield rollout status deployment/moya4
 ```
 
-### ドメイン・TLS設定だけを変更した場合
+### 公開方式(Service/Ingress)だけを変更した場合
 
-`k8s/ingress.yaml` を編集して `kubectl apply -k k8s/` を実行するだけでよい
-(Podの再起動は不要)。
+`k8s/service.yaml`(または`k8s/ingress.yaml`、切り替えている場合)を編集して
+`kubectl apply -k k8s/` を実行するだけでよい(Podの再起動は不要)。
 
 ## 4. 削除(後始末)
 
@@ -227,9 +246,11 @@ Namespace(`pii-masking-shield`)ごと削除され、`kubectl create secret` で
 | Podが`Pending`のまま | PVCがbindできていない(StorageClass不一致) | `kubectl -n pii-masking-shield get pvc` / `kubectl get storageclass` |
 | `ImagePullBackOff` | レジストリ認証Secット未設定・誤り、またはレジストリがHTTPS化されていない | `kubectl -n pii-masking-shield describe pod <pod名>` |
 | Podは`Running`だが`Ready`にならない | 起動直後でspaCyモデル読み込み中(`startupProbe`待ち、数十秒かかることがある) | `kubectl -n pii-masking-shield logs deployment/moya4` |
-| Ingress経由でアクセスできない | `ingressClassName` が実際のクラスタの名前と違う | `kubectl get ingressclass`(上記1章参照) |
-| HTTPSでアクセスできない・証明書エラー | `moya4-tls` Secretが未作成、または証明書ファイルが誤っている(このクラスタではcert-manager自動発行は使えない。上記「TLS証明書(手動登録)の設定」参照) | `kubectl -n pii-masking-shield get secret moya4-tls` |
-| Challengeが`pending`のまま・`admission webhook "validate-idcf-ingress.idcfcloud.com" denied ... defaultBackend or ... path or "/" is required` | cert-managerのHTTP-01検証用一時IngressがIDCFの管理Webhookに拒否されている(このクラスタでは構造的に非対応。手動証明書登録に切り替える) | `kubectl -n pii-masking-shield describe challenge <name>` |
-| `kubectl apply`が`admission webhook "validate-idcf-ingress.idcfcloud.com" denied`で失敗 | IngressのpathTypeが`ImplementationSpecific`以外になっている(IDCF独自の制約。`k8s/ingress.yaml`は対応済み) | `kubectl -n pii-masking-shield get ingress moya4 -o yaml \| Select-String pathType` |
-| Ingressの`ADDRESS`が割り当てられない・`generateLB failed`エラー | `ilb.idcfcloud.com/sslpolicy-id` annotationが未設定、またはSSLポリシーIDが誤っている | `kubectl -n pii-masking-shield describe ingress moya4` |
-| Googleログインでエラーになる | Ingressのホスト名とGoogle Cloud ConsoleのリダイレクトURIが不一致 | `kubectl -n pii-masking-shield get ingress moya4 -o yaml` |
+| `svc/moya4`の`EXTERNAL-IP`が`<pending>`のまま | ILBの申し込み・契約が完了していない | `kubectl -n pii-masking-shield describe svc moya4` / IDCFコンソールでILBの状態を確認 |
+| `http://masking.pdpro.jp:8000/`にアクセスできない | DNSのAレコードが`svc/moya4`の`EXTERNAL-IP`を指していない、または反映待ち | `nslookup masking.pdpro.jp` / `kubectl -n pii-masking-shield get svc moya4` |
+| Googleログインでエラーになる | Google Cloud Consoleの承認済みリダイレクトURIと実際のURL(`http://masking.pdpro.jp:8000/auth/callback`)が不一致、またはGoogle側がHTTPのリダイレクトURIを拒否している | Google Cloud Consoleの認証情報画面を確認 |
+| （Ingress+ドメイン+TLS方式に切り替えた場合）Ingress経由でアクセスできない | `ingressClassName` が実際のクラスタの名前と違う | `kubectl get ingressclass`(上記1章参照) |
+| （同上）HTTPSでアクセスできない・証明書エラー | `moya4-tls` Secretが未作成、または証明書ファイルが誤っている(このクラスタではcert-manager自動発行は使えない。上記「TLS証明書(手動登録)の設定」参照) | `kubectl -n pii-masking-shield get secret moya4-tls` |
+| （同上）Challengeが`pending`のまま・`admission webhook "validate-idcf-ingress.idcfcloud.com" denied ... defaultBackend or ... path or "/" is required` | cert-managerのHTTP-01検証用一時IngressがIDCFの管理Webhookに拒否されている(このクラスタでは構造的に非対応。手動証明書登録に切り替える) | `kubectl -n pii-masking-shield describe challenge <name>` |
+| （同上）`kubectl apply`が`admission webhook "validate-idcf-ingress.idcfcloud.com" denied`で失敗 | IngressのpathTypeが`ImplementationSpecific`以外になっている(IDCF独自の制約。`k8s/ingress.yaml`は対応済み) | `kubectl -n pii-masking-shield get ingress moya4 -o yaml \| Select-String pathType` |
+| （同上）Ingressの`ADDRESS`が割り当てられない・`generateLB failed`エラー | `ilb.idcfcloud.com/sslpolicy-id` annotationが未設定、またはSSLポリシーIDが誤っている | `kubectl -n pii-masking-shield describe ingress moya4` |
