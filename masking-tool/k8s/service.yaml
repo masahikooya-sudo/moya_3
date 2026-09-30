@@ -1,17 +1,7 @@
-# ドメインを使い、IDCFクラウドのILB(Infinite LB)経由でこのアプリのServiceを
-# 直接公開する構成(社員は`https://masking.pdpro.jp:8000/`でアクセスする想定。
-# masking.pdpro.jpのDNS Aレコードを、下記で確認できるILBのIPに向ける必要がある)。
-#
-# TLSはKubernetes側(cert-manager/Secret)ではなく、ILB自体で終端する
-# (証明書はIDCFクラウド コンソールで、ilb.idcfcloud.com/sslpolicy-id
-# annotationが指すSSLポリシーに紐づけて登録する。証明書ファイルの準備・登録は
-# クラスタ外(IDCFコンソール側)の作業になる)。ILBがTLSを復号した後、
-# Serviceへは平文HTTPで転送される。
-#
-# 【未検証】ilb.idcfcloud.com/sslpolicy-id annotationは、Ingressリソースでは
-# 実機で動作を確認済みだが、type: LoadBalancerのServiceに対しても同様に
-# 機能するかは未確認。適用後 `kubectl describe svc moya4` のEventsを確認し、
-# LB生成に失敗していないかチェックすること。
+# ドメインは使うが、Ingress/TLSは使わず、IDCFクラウドのILB(Infinite LB)経由で
+# このアプリのServiceを直接HTTP公開する構成(社員は`http://masking.pdpro.jp:8000/`
+# でアクセスする想定。masking.pdpro.jpのDNS Aレコードを、下記で確認できる
+# ILBのIPに向ける必要がある)。
 #
 # annotationの `loadbalancer.idcfcloud.com/loadbalancer-class: "ilb"` により、
 # 申し込み済みのILBがこのServiceに割り当てられる。
@@ -27,9 +17,6 @@ metadata:
   namespace: pii-masking-shield
   annotations:
     loadbalancer.idcfcloud.com/loadbalancer-class: "ilb"
-    # IDCFクラウド コンソールで発行済みのSSLポリシーID(証明書はこのSSL
-    # ポリシーに紐づけてコンソール側で登録する)。
-    ilb.idcfcloud.com/sslpolicy-id: "8d74a56f-3248-43aa-b08b-ee4ad7ab5900"
 spec:
   selector:
     app: moya4

@@ -225,44 +225,39 @@ kubectl create secret generic moya4-secrets \
   --from-literal=SESSION_SECRET_KEY="$(openssl rand -hex 32)"
 ```
 
-#### 4. ILBによる公開(現在の既定構成: ドメイン+ポート8000・ILBでTLS終端)
+#### 4. ILBによる公開(現在の既定構成: ドメイン+ポート8000・HTTP)
 
 現在の既定構成では、Ingressは使わず、`k8s/service.yaml`(`type: LoadBalancer`、
 `loadbalancer.idcfcloud.com/loadbalancer-class: "ilb"` annotation)で申し込み
 済みのILBをこのアプリのServiceに直接割り当てる。社員は
-`https://masking.pdpro.jp:8000/` でアクセスする。
-
-**TLSはKubernetes側(cert-manager/Secret)ではなく、ILB自体で終端する。**
-証明書は、IDCFクラウド コンソールで、`k8s/service.yaml` の
-`ilb.idcfcloud.com/sslpolicy-id` annotationが指すSSLポリシーに紐づけて
-登録する(証明書ファイルの準備・登録はクラスタ外、IDCFコンソール側の作業)。
-ILBがTLSを復号した後、Serviceへは平文HTTPで転送される。
-
-> **【未検証】** `ilb.idcfcloud.com/sslpolicy-id` annotationは、Ingress
-> リソースでは実機で動作を確認済みだが、`type: LoadBalancer` のServiceに
-> 対しても同様に機能するかは未確認。適用後、下記コマンドでLB生成に失敗して
-> いないか確認すること。
+`http://masking.pdpro.jp:8000/` でアクセスする(TLSは使わないHTTP配信)。
 
 ```bash
-kubectl -n pii-masking-shield describe svc moya4
 kubectl -n pii-masking-shield get svc moya4
 # EXTERNAL-IP列に割り当てられたIPが表示される
 ```
 
 `EXTERNAL-IP` が確認できたら、DNS側で `masking.pdpro.jp` のAレコードをこの
 IPに向ける(社内DNS、または利用しているドメイン管理サービスで設定する)。
-Google Cloud ConsoleのOAuthクライアントの「承認済みのリダイレクトURI」には
-`https://masking.pdpro.jp:8000/auth/callback` を登録する。
 
-ドメイン名+Ingress経由でのTLS終端(cert-manager等)を使う構成に変更したい
-場合は、`k8s/service.yaml` を `k8s/service-clusterip.example.yaml` の内容で
-上書きし、`k8s/kustomization.yaml` の `resources` に `ingress.yaml` を
-追加する。`k8s/ingress.yaml` にはドメイン `masking.pdpro.jp` とSSLポリシー
-IDを設定済みだが、**このクラスタではcert-manager(Let's EncryptのHTTP-01
-検証)は使えないことを実機で確認済み**(cert-managerが検証用に自動生成する
-一時Ingressを、IDCF独自の管理Webhookが拒否するため)。そちらを使う場合も、
-Kubernetesが自動発行するのではなく、既存の証明書ファイルを以下のように
-手動でSecret登録する必要がある。
+> **Googleログインに関する重要な注意**: この構成はHTTPで公開されるため、
+> Google Cloud ConsoleのOAuthクライアントの「承認済みのリダイレクトURI」には
+> `http://masking.pdpro.jp:8000/auth/callback` を登録する。Googleは通常、
+> `localhost` 以外のHTTPリダイレクトURIを本番用途では受け付けない
+> (登録時に拒否される、またはOAuthフロー自体がブロックされる)可能性がある。
+> 実際にGoogle Cloud Consoleで登録できるか確認し、うまくいかない場合は
+> ドメイン+Ingress+TLSの構成(下記)に切り替える必要がある。
+
+ドメイン名+TLS終端(cert-manager等、またはこのクラスタでは動作しないため
+既存証明書の手動登録)を使う構成に変更したい場合は、`k8s/service.yaml` を
+`k8s/service-clusterip.example.yaml` の内容で上書きし、
+`k8s/kustomization.yaml` の `resources` に `ingress.yaml` を追加した上で、
+`k8s/configmap.yaml` の `SESSION_HTTPS_ONLY` を `"true"` に戻す。
+`k8s/ingress.yaml` にはドメイン `masking.pdpro.jp` とSSLポリシーIDを設定済み
+だが、**このクラスタではcert-manager(Let's EncryptのHTTP-01検証)は使えない
+ことを実機で確認済み**(cert-managerが検証用に自動生成する一時Ingressを、
+IDCF独自の管理Webhookが拒否するため)。そのため既存の証明書ファイルを
+以下のように手動でSecret登録する必要がある。
 
 ```bash
 kubectl -n pii-masking-shield create secret tls moya4-tls \

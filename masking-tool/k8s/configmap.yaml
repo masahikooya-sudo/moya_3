@@ -15,7 +15,8 @@ data:
   AUTH_ENABLED: "true"
   # ログインを許可するGoogle Workspaceドメイン。
   GOOGLE_ALLOWED_DOMAIN: "pdpro.jp"
-  # ILBでTLS終端し、ブラウザからはHTTPSでアクセスする構成のため true
-  # (セッションCookieにSecure属性を付与する)。ILB側の証明書設定が無い、
-  # または平文HTTPで配信する構成に戻す場合はfalseにすること。
-  SESSION_HTTPS_ONLY: "true"
+  # ドメイン(masking.pdpro.jp)は使うが、Ingress/TLSは使わずILBに直接HTTP
+  # (ポート8000)でアクセスする構成のため false。TLS終端(ドメイン+Ingress+
+  # cert-manager等)を使う構成に変更した場合は、セッションCookieにSecure
+  # 属性を付与するためtrueに変更すること。
+  SESSION_HTTPS_ONLY: "false"
