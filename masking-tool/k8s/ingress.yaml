@@ -1,0 +1,60 @@
+# IDCFクラウド コンテナには、nginx等の汎用Ingress Controllerではなく、
+# 独自のIngressClass(`idcf-ilb`、コントローラーは`idcfcloud.com/idcf-ingress`)
+# が用意されている(`kubectl get ingressclass` で実機確認済み)。これを
+# 指定するだけでILBとの連携が行われる(環境によって名前が異なる可能性が
+# あるため、必ず自分のクラスタで確認してから合わせること)。
+#
+# TLS証明書は kojiaki131/idcf-dns-certbot (DNS-01検証でLet's Encryptの
+# 証明書を取得・更新するCronJob)で自動管理する。certbotは更新した証明書を
+# ILBへアップロードし、このIngressの `ilb.idcfcloud.com/sslcert-id`
+# annotationを新しい証明書IDに差し替える(アノテーション方式。ILBで
+# TLSを終端するため、`tls:` ブロックとTLS Secretは使わない)。
+#
+# バックエンドのService(k8s/service.yaml)は必ずNodePortにすること
+# (ClusterIPだと "default server is not set" でLB生成に失敗する)。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: moya4
+  namespace: pii-masking-shield
+  annotations:
+    # IDCFクラウドのIngressでHTTPSを使う場合、事前にコンソールで発行した
+    # SSLポリシーのIDをここに指定しないとLBの生成に失敗する
+    # (`generateLB failed: ... sslpolicy-id annotation is not found`)。
+    ilb.idcfcloud.com/sslpolicy-id: "8d74a56f-3248-43aa-b08b-ee4ad7ab5900"
+    # 【注意】`ilb.idcfcloud.com/sslcert-id` はここに書かないこと。
+    # idcf-dns-certbotが証明書の更新のたびに書き換えるため、固定値を
+    # 書いておくと `kubectl apply -k k8s/` のたびに古い証明書IDへ
+    # 巻き戻ってしまう。初回だけ `kubectl annotate` で付与する
+    # (k8s/OPERATIONS.md の「TLS証明書(idcf-dns-certbotによる自動更新)」参照)。
+    #
+    # ILBをインターネットから到達可能にする(パブリックIPを割り当てる)場合は
+    # 次のannotationを有効にする。VPN経由のみで使うプライベートILBなら不要。
+    # ilb.idcfcloud.com/public-ipaddress-assignment: "true"
+spec:
+  ingressClassName: idcf-ilb
+  rules:
+    # ILB利用時は host・path を指定しない形(pathTypeはImplementationSpecific)
+    # にする(他のアプリで実機動作確認済みの形に合わせている)。
+    # 以前は host 指定ルールや defaultBackend / tls.hosts を追加して
+    # "default server is not set" の回避を試していたが、原因はServiceが
+    # ClusterIPだったことのため、これらは削除した。
+    # masking.pdpro.jp のDNS(Aレコード)をILBのアドレスへ向けることで
+    # https://masking.pdpro.jp/ でアクセスできる。
+    - http:
+        paths:
+          # IDCFクラウドの独自Ingress用アドミッションWebhook
+          # (validate-idcf-ingress.idcfcloud.com)は、pathTypeとして
+          # ImplementationSpecific以外(Prefix/Exact)を拒否することを
+          # 実機で確認した。
+          - pathType: ImplementationSpecific
+            backend:
+              service:
+                name: moya4
+                port:
+                  # Serviceのport(k8s/service.yaml の 80)を番号で指定する。
+                  # 名前参照(name: http)だと、IDCFのIngressコントローラーが
+                  # バックエンドポートを解決できず port:0 になり、ILB生成が
+                  # 失敗することを実機で確認した
+                  # (`create job id is empty: ... port:0 is invalid`)。
+                  number: 80

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: moya4
+  namespace: pii-masking-shield
+spec:
+  selector:
+    app: moya4
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  # IDCFクラウドのILB(Ingress)は各ノードのNodePortへ転送するため、
+  # Ingressのバックエンドに指定できるのはNodePortのServiceのみ。
+  # ClusterIPのままだとILBの振り分け先(サーバー)が作れず、
+  # "generateLB failed: default server is not set" で失敗する。
+  type: NodePort

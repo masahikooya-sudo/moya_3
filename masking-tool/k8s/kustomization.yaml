@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  # secret.example.yaml はテンプレートなので含めない。
+  # moya4-secrets は `kubectl create secret generic` で別途作成すること。
+
+# GitHub Container Registry(ghcr.io)を使う。IDCFクラウド側のレジストリを
+# 使う場合は newName をそちらの実際のホスト名に置き換える。
+images:
+  - name: moya4
+    newName: ghcr.io/masahikooya-sudo/moya4
+    newTag: latest

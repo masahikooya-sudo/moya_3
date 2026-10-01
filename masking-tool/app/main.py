@@ -1,0 +1,332 @@
+import io
+import json
+import logging
+import os
+import re
+import secrets
+from contextlib import asynccontextmanager
+from typing import List, Optional
+from urllib.parse import quote
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+
+from . import audit_log, auth, config
+from .engine import get_analyzer, mask_text
+from .file_processing import (
+    analyze_csv_columns,
+    analyze_docx_candidates,
+    analyze_json_columns,
+    analyze_pdf_candidates,
+    analyze_pptx_candidates,
+    analyze_txt_candidates,
+    analyze_xlsx_columns,
+    mask_csv_file,
+    mask_docx_file,
+    mask_json_file,
+    mask_pdf_file,
+    mask_plain_text_file,
+    mask_pptx_file,
+    mask_xlsx_file,
+)
+
+MEDIA_TYPES = {
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".pdf": "application/pdf",
+    ".json": "application/json",
+}
+
+# 列(ヘッダー)があり、列名から対象データを選択できる形式。
+TABULAR_EXTENSIONS = {".csv", ".xlsx", ".json"}
+# 明確な列を持たず、検出候補を一覧確認してからマスキングする形式。
+FREEFORM_EXTENSIONS = {".txt", ".docx", ".pptx", ".pdf"}
+
+ANALYZE_HANDLERS = {
+    ".csv": analyze_csv_columns,
+    ".xlsx": analyze_xlsx_columns,
+    ".json": analyze_json_columns,
+    ".txt": analyze_txt_candidates,
+    ".docx": analyze_docx_candidates,
+    ".pptx": analyze_pptx_candidates,
+    ".pdf": analyze_pdf_candidates,
+}
+
+logger = logging.getLogger("pii_masking_app")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Presidio/spaCyの初期化(モデル読み込み)は数秒〜数十秒かかることがある。
+    # 遅延初期化のままだと最初のリクエストがこのコストを負担してしまうため、
+    # 起動時に一度だけ読み込んでおく。これによりサーバーがリクエストを受け付け
+    # 始めた時点でモデルの読み込みも完了していることが保証され、
+    # Kubernetes等のヘルスチェック(/healthz)を素直に使えるようになる。
+    logger.info("Presidio/spaCyエンジンを初期化しています…")
+    get_analyzer()
+    logger.info("初期化が完了しました。リクエストの受付を開始します。")
+    yield
+
+
+app = FastAPI(title="日本語マスキングツール", lifespan=lifespan)
+
+STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+
+VALID_STYLES = {"tag", "mask", "redact"}
+
+# /healthz はコンテナオーケストレーター(Kubernetes等)のヘルスチェック用に、
+# ログイン不要・認証ミドルウェアの影響を受けない固定パスとして公開する。
+PUBLIC_PATHS = {"/login", "/auth/login", "/auth/callback", "/healthz"}
+
+
+@app.get("/healthz")
+def healthz():
+    """稼働確認用エンドポイント。認証不要。
+
+    起動時(lifespan)でPresidio/spaCyエンジンの初期化を完了させてから
+    リクエストの受付を開始するため、このエンドポイントが応答している時点で
+    マスキング処理も実行可能な状態にある。
+    """
+    return {"status": "ok"}
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """未対応の例外を捕捉し、JSONで500エラーを返す。
+
+    既定のStarletteの挙動では、未対応の例外は素のテキスト("Internal Server Error")
+    として返され、フロントエンドがレスポンスをJSONとしてパースしようとして失敗する
+    (例: ファイルが破損している等、file_processing.py 側で ValueError に変換し
+    きれなかったケース)。ここでJSONレスポンスに統一し、フロントエンドが常に
+    detail フィールドを読める状態を保証する。詳細はサーバーログに出力する。
+    """
+    logger.exception("Unhandled error while handling %s %s", request.method, request.url.path)
+    return JSONResponse(
+        {"detail": "サーバー内部でエラーが発生しました。しばらくしてから再度お試しください。"},
+        status_code=500,
+    )
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """未ログインのアクセスを /login へ誘導する(APIは401を返す)。"""
+
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        if (
+            not config.AUTH_ENABLED
+            or path in PUBLIC_PATHS
+            or path.startswith("/static/")
+            or auth.is_authenticated(request)
+        ):
+            return await call_next(request)
+
+        if path.startswith("/api/"):
+            return JSONResponse({"detail": "ログインが必要です"}, status_code=401)
+        return RedirectResponse(url="/login")
+
+
+app.include_router(auth.router)
+
+# ミドルウェアは後から追加したものほど外側(先に実行)になるため、
+# セッションを参照する AuthMiddleware より後に SessionMiddleware を追加する。
+app.add_middleware(AuthMiddleware)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=config.SESSION_SECRET_KEY or secrets.token_hex(32),
+    same_site="lax",
+    https_only=config.SESSION_HTTPS_ONLY,
+)
+
+
+@app.get("/api/me")
+def get_me(request: Request):
+    return request.session.get("user")
+
+
+class MaskTextRequest(BaseModel):
+    text: str = Field(..., description="マスキング対象のテキスト")
+    entities: Optional[List[str]] = Field(
+        default=None, description="検出したいエンティティ種別。未指定時は全種別。"
+    )
+    style: str = Field(default="tag", description="置換方式: tag / mask / redact")
+
+
+class DetectionItem(BaseModel):
+    entity_type: str
+    entity_label: str
+    start: int
+    end: int
+    score: float
+    text: str
+
+
+class MaskTextResponse(BaseModel):
+    masked_text: str
+    detections: List[DetectionItem]
+
+
+def _validate_entities(entities: Optional[List[str]]) -> List[str]:
+    if not entities:
+        return config.ALL_ENTITY_CODES
+    invalid = [e for e in entities if e not in config.ALL_ENTITY_CODES]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"不明なエンティティ種別です: {invalid}")
+    return entities
+
+
+def _validate_style(style: str) -> str:
+    if style not in VALID_STYLES:
+        raise HTTPException(status_code=400, detail=f"不明なマスキング方式です: {style}")
+    return style
+
+
+def _content_disposition(filename: str) -> str:
+    """日本語等のファイル名にも対応したContent-Dispositionヘッダーを組み立てる。
+
+    HTTPヘッダーはLatin-1でしかエンコードできないため、非ASCII文字を含む
+    ファイル名をそのまま filename= に入れると送出時に例外になる。
+    RFC 6266 の filename*(UTF-8, パーセントエンコード)を併記し、
+    対応していないクライアント向けに ASCII 変換したフォールバックも残す。
+    """
+    ascii_fallback = re.sub(r"[^\x20-\x7e]", "_", filename).replace('"', "'") or "download"
+    encoded = quote(filename, safe="")
+    return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded}'
+
+
+@app.get("/api/entities")
+def get_entities():
+    return {"entities": config.ENTITY_DEFINITIONS}
+
+
+@app.post("/api/mask/text", response_model=MaskTextResponse)
+def mask_text_endpoint(body: MaskTextRequest, request: Request):
+    entities = _validate_entities(body.entities)
+    style = _validate_style(body.style)
+
+    if len(body.text) > 200_000:
+        raise HTTPException(status_code=400, detail="テキストが長すぎます(20万文字以内)")
+
+    masked_text, detections = mask_text(body.text, entities=entities, style=style)
+    user_email = auth.get_current_user_email(request)
+    audit_log.log_text_request(user_email, body.text, style, entities, detections)
+    return {"masked_text": masked_text, "detections": detections}
+
+
+async def _read_upload(file: UploadFile) -> tuple:
+    filename = file.filename or "upload"
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in config.SUPPORTED_EXTENSIONS:
+        supported = " / ".join(config.SUPPORTED_EXTENSIONS)
+        raise HTTPException(status_code=400, detail=f"対応していないファイル形式です({supported} のみ)")
+
+    raw = await file.read()
+    if len(raw) > config.MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=400, detail="ファイルサイズが上限を超えています")
+
+    return filename, ext, raw
+
+
+@app.post("/api/analyze/file")
+async def analyze_file_endpoint(
+    file: UploadFile = File(...),
+    entities: Optional[str] = Form(default=None, description="カンマ区切りのエンティティ種別"),
+):
+    """アップロードされたファイルをマスキングせずに解析し、確認用の候補を返す。
+
+    表形式(csv/xlsx/json)は列名から推定したエンティティ種別付きの列一覧を、
+    自由形式(txt/docx/pptx/pdf)は検出されたPII候補の一覧を返す。
+    ユーザーはこれを確認・調整した上で /api/mask/file を呼び出す想定。
+    """
+    entity_list = _validate_entities(
+        [e.strip() for e in entities.split(",") if e.strip()] if entities else None
+    )
+    _filename, ext, raw = await _read_upload(file)
+
+    try:
+        if ext in TABULAR_EXTENSIONS:
+            groups = ANALYZE_HANDLERS[ext](raw, entity_list)
+            return {"kind": "tabular", "groups": groups}
+        candidates = ANALYZE_HANDLERS[ext](raw, entity_list)
+        return {"kind": "freeform", "candidates": candidates}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/mask/file")
+async def mask_file_endpoint(
+    request: Request,
+    file: UploadFile = File(...),
+    entities: Optional[str] = Form(default=None, description="カンマ区切りのエンティティ種別"),
+    style: str = Form(default="tag"),
+    column_overrides: Optional[str] = Form(
+        default=None,
+        description="表形式ファイル向け。列キー(文字列) -> エンティティ種別 または null のJSONオブジェクト。"
+        "指定した場合、列名からの自動判定の代わりに使用する。",
+    ),
+    confirmed_candidates: Optional[str] = Form(
+        default=None,
+        description="自由形式ファイル向け。[{\"entity_type\":..., \"text\":...}, ...] のJSON配列。"
+        "指定した場合、この一覧に含まれる検出のみをマスキング対象とする。",
+    ),
+):
+    entity_list = _validate_entities(
+        [e.strip() for e in entities.split(",") if e.strip()] if entities else None
+    )
+    style = _validate_style(style)
+    filename, ext, raw = await _read_upload(file)
+
+    handlers = {
+        ".csv": mask_csv_file,
+        ".txt": mask_plain_text_file,
+        ".xlsx": mask_xlsx_file,
+        ".docx": mask_docx_file,
+        ".pptx": mask_pptx_file,
+        ".pdf": mask_pdf_file,
+        ".json": mask_json_file,
+    }
+
+    kwargs = {}
+    if ext in TABULAR_EXTENSIONS and column_overrides:
+        try:
+            kwargs["column_overrides"] = json.loads(column_overrides)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="column_overrides の形式が不正です")
+    elif ext in FREEFORM_EXTENSIONS and confirmed_candidates:
+        try:
+            parsed = json.loads(confirmed_candidates)
+            kwargs["confirmed"] = {(c["entity_type"], c["text"]) for c in parsed}
+        except (json.JSONDecodeError, KeyError, TypeError):
+            raise HTTPException(status_code=400, detail="confirmed_candidates の形式が不正です")
+
+    try:
+        masked_bytes, detections, raw_text = handlers[ext](raw, entity_list, style, **kwargs)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    user_email = auth.get_current_user_email(request)
+    audit_log.log_file_request(user_email, filename, ext, style, entity_list, detections, raw_text)
+
+    media_type = MEDIA_TYPES[ext]
+
+    download_name = f"masked_{filename}"
+    headers = {
+        "Content-Disposition": _content_disposition(download_name),
+        "X-Detection-Count": str(len(detections)),
+    }
+    return StreamingResponse(io.BytesIO(masked_bytes), media_type=media_type, headers=headers)
+
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    with open(os.path.join(STATIC_DIR, "index.html"), encoding="utf-8") as f:
+        return f.read()
